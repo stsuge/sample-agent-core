@@ -43,84 +43,99 @@ function App() {
     setInput('');
     setLoading(true);
 
-    // Cognito認証トークンを取得
-    const session = await fetchAuthSession();
-    const accessToken = session.tokens?.accessToken?.toString();
+    try {
+      // Cognito認証トークンを取得
+      const session = await fetchAuthSession();
+      const accessToken = session.tokens?.accessToken?.toString();
 
-    // AgentCore Runtime APIを呼び出し
-    const url = `https://bedrock-agentcore.ap-northeast-1.amazonaws.com/runtimes/${encodeURIComponent(AGENT_ARN)}/invocations?qualifier=DEFAULT`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: userMessage.content }),
-    });
+      // AgentCore Runtime APIを呼び出し
+      const url = `https://bedrock-agentcore.ap-northeast-1.amazonaws.com/runtimes/${encodeURIComponent(AGENT_ARN)}/invocations?qualifier=DEFAULT`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: userMessage.content }),
+      });
 
-    // SSEストリーミングを処理
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let isInToolUse = false;
-    let toolIdx = -1;
+      // SSEストリーミングを処理
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let isInToolUse = false;
+      let toolIdx = -1;
+      let sseRemainder = '';
 
-    // ストリームを読み続ける
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      // ストリームを読み続ける
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      // 受信データを行ごとに処理
-      for (const line of decoder.decode(value, { stream: true }).split('\n')) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6);
-        if (data === '[DONE]') continue;
-        const event = JSON.parse(data);
+        // チャンク境界をまたぐ行を正しく処理するためバッファに蓄積
+        sseRemainder += decoder.decode(value, { stream: true });
+        const lines = sseRemainder.split('\n');
+        sseRemainder = lines.pop() ?? '';
 
-        // ツール使用開始イベント
-        if (event.type === 'tool_use') {
-          isInToolUse = true;
-          const savedBuffer = buffer;
-          setMessages(prev => {
-            const msgs = [...prev];
-            if (savedBuffer) {
-              msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], content: savedBuffer };
-              toolIdx = msgs.length;
-              msgs.push({ id: crypto.randomUUID(), role: 'assistant', content: '', isToolUsing: true, toolName: event.tool_name });
+        // 受信データを行ごとに処理
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+
+          let event;
+          try {
+            event = JSON.parse(data);
+          } catch {
+            continue;
+          }
+
+          // ツール使用開始イベント
+          if (event.type === 'tool_use') {
+            isInToolUse = true;
+            const savedBuffer = buffer;
+            setMessages(prev => {
+              const msgs = [...prev];
+              if (savedBuffer) {
+                msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], content: savedBuffer };
+                toolIdx = msgs.length;
+                msgs.push({ id: crypto.randomUUID(), role: 'assistant', content: '', isToolUsing: true, toolName: event.tool_name });
+              } else {
+                toolIdx = msgs.length - 1;
+                msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], isToolUsing: true, toolName: event.tool_name };
+              }
+              return msgs;
+            });
+            buffer = '';
+            continue;
+          }
+
+          // テキストイベント（AI応答本文）
+          if (event.type === 'text' && event.data) {
+            if (isInToolUse && !buffer) {
+              // ツール実行後の最初のテキスト → ツールを完了状態に
+              const savedIdx = toolIdx;
+              setMessages(prev => {
+                const msgs = [...prev];
+                if (savedIdx >= 0 && savedIdx < msgs.length) msgs[savedIdx] = { ...msgs[savedIdx], toolCompleted: true };
+                msgs.push({ id: crypto.randomUUID(), role: 'assistant', content: event.data });
+                return msgs;
+              });
+              buffer = event.data;
+              isInToolUse = false;
+              toolIdx = -1;
             } else {
-              toolIdx = msgs.length - 1;
-              msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], isToolUsing: true, toolName: event.tool_name };
+              // 通常のテキスト蓄積（ストリーミング表示）
+              buffer += event.data;
+              setMessages(prev => {
+                const msgs = [...prev];
+                msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], content: buffer, isToolUsing: false };
+                return msgs;
+              });
             }
-            return msgs;
-          });
-          buffer = '';
-          continue;
-        }
-
-        // テキストイベント（AI応答本文）
-        if (event.type === 'text' && event.data) {
-          if (isInToolUse && !buffer) {
-            // ツール実行後の最初のテキスト → ツールを完了状態に
-            const savedIdx = toolIdx;
-            setMessages(prev => {
-              const msgs = [...prev];
-              if (savedIdx >= 0 && savedIdx < msgs.length) msgs[savedIdx] = { ...msgs[savedIdx], toolCompleted: true };
-              msgs.push({ id: crypto.randomUUID(), role: 'assistant', content: event.data });
-              return msgs;
-            });
-            buffer = event.data;
-            isInToolUse = false;
-            toolIdx = -1;
-          } else {
-            // 通常のテキスト蓄積（ストリーミング表示）
-            buffer += event.data;
-            setMessages(prev => {
-              const msgs = [...prev];
-              msgs[msgs.length - 1] = { ...msgs[msgs.length - 1], content: buffer, isToolUsing: false };
-              return msgs;
-            });
           }
         }
       }
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   // チャットUI（ヘッダー＋チャットエリア＋入力フォーム）
